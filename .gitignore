@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Environment secrets (never commit)
+.env
+.env.local
+.env.production
+
+# SQLite databases (runtime state — use volumes)
+*.db
+*.db-shm
+*.db-wal
+
+# Sensitive runtime files
+admin_id.txt
+
+# Bot output / temp files
+zipFile.zip
+*.zip
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Replit internals
+.replit
+replit.nix
+.cache/
+.local/
+.upm/
+
+# Docker
+*.tar
