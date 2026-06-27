@@ -4114,8 +4114,11 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     # ── Session watchdog + command menu registration ─────────────────────
+    _watchdog_task: asyncio.Task | None = None
+
     async def _post_init(application: Application) -> None:
-        asyncio.create_task(_session_watchdog())
+        nonlocal _watchdog_task
+        _watchdog_task = asyncio.create_task(_session_watchdog())
         # Register bot commands so they appear in Telegram's / menu
         from telegram import BotCommand
         global _BOT_USERNAME
@@ -4135,7 +4138,17 @@ def main() -> None:
             BotCommand("userlist",   "👥 Download full user list (admin)"),
         ])
 
-    app.post_init = _post_init
+    async def _post_shutdown(application: Application) -> None:
+        nonlocal _watchdog_task
+        if _watchdog_task and not _watchdog_task.done():
+            _watchdog_task.cancel()
+            try:
+                await _watchdog_task
+            except asyncio.CancelledError:
+                pass
+
+    app.post_init     = _post_init
+    app.post_shutdown = _post_shutdown
 
     print("✅ Netflix Cookie Checker Bot is running…")
     app.run_polling(
