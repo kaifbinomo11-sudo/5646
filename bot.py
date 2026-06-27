@@ -1141,6 +1141,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user:
         stats_tracker.record_user(update.effective_user.id)
+        user_store.register_user(update.effective_user.id)
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🪙 Buy Tokens",  callback_data="nav:buy"),
@@ -1830,6 +1831,8 @@ async def _handle_proxy_txt_upload(update: Update, uid: int, for_admin: bool) ->
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     doc: Document = update.message.document
     uid = update.effective_user.id if update.effective_user else None
+    if uid:
+        user_store.register_user(uid)
 
     # ── Proxy TXT upload intercept (user or admin) ─────────────────────────
     if uid and (uid in _USER_PROXY_FILE_STATE or
@@ -3364,6 +3367,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uid = update.effective_user.id if update.effective_user else None
     if update.effective_user:
         stats_tracker.record_user(update.effective_user.id)
+        user_store.register_user(update.effective_user.id)
 
     text = update.message.text.strip()
     if not text:
