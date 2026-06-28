@@ -11,7 +11,7 @@ import re
 import logging
 import threading
 import time
-from urllib.parse import quote_plus
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def _try_connect() -> bool:
     m = re.match(r'(mongodb(?:\+srv)?://[^:]+:)(.+?)(@[^@]+$)', url)
     if m:
         prefix, password, suffix = m.group(1), m.group(2), m.group(3)
-        url = prefix + quote_plus(password) + suffix
+        url = prefix + quote(password, safe="") + suffix
     try:
         import pymongo  # type: ignore
         client = pymongo.MongoClient(

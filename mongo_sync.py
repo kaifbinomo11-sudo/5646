@@ -23,7 +23,7 @@ import re
 import threading
 import logging
 import time
-from urllib.parse import quote_plus
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def _try_connect() -> bool:
         import pymongo
         m = re.match(r'(mongodb(?:\+srv)?://[^:]+:)(.+?)(@[^@]+$)', url)
         if m:
-            url = m.group(1) + quote_plus(m.group(2)) + m.group(3)
+            url = m.group(1) + quote(m.group(2), safe="") + m.group(3)
         client = pymongo.MongoClient(
             url,
             serverSelectionTimeoutMS=8000,

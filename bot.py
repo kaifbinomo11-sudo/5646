@@ -33,6 +33,7 @@ from dashboard import start_dashboard
 import mongodb_store
 import user_store
 from user_store import TOKEN_PACKS as _TOKEN_PACKS, TOKEN_COSTS as _TOKEN_COSTS
+import proxy_manager as _proxy_manager_module  # eager init: restores proxy pool from MongoDB at startup
 from telegram import LabeledPrice
 
 logging.basicConfig(
