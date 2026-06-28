@@ -32,6 +32,43 @@ import requests.adapters
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
+# ── Cloudflare Worker relay (optional) ───────────────────────────────────────
+# Set CF_WORKER_URL env var to your Worker URL. Toggle ON/OFF in /proxy panel.
+_CF_WORKER_URL: str = os.environ.get("CF_WORKER_URL", "").rstrip("/")
+_CF_PROXY_KEY:  str = os.environ.get("CF_PROXY_KEY", "")
+
+
+def _cf_worker_attempt(target_url: str, cookies: dict, timeout: float = 8.0):
+    """
+    Route a Netflix request through the Cloudflare Worker relay.
+    Returns ("OK"|"INVALID"|"LOGIN"|"FAIL", html_text).
+    Raced alongside normal proxies — fastest result wins.
+    """
+    if not _CF_WORKER_URL:
+        return "FAIL", ""
+    try:
+        hdrs: dict = {"Content-Type": "application/json"}
+        if _CF_PROXY_KEY:
+            hdrs["X-Proxy-Key"] = _CF_PROXY_KEY
+        payload = json.dumps({"url": target_url, "cookies": cookies, "method": "GET"}).encode()
+        resp = requests.post(_CF_WORKER_URL, data=payload, headers=hdrs, timeout=timeout)
+        if resp.status_code != 200:
+            return "FAIL", ""
+        data = resp.json()
+        status    = data.get("status", 0)
+        body      = data.get("body", "")
+        final_url = data.get("url", target_url)
+        if status in (401, 403):
+            return "INVALID", body
+        if _is_login_page(final_url, body):
+            return "LOGIN", body
+        if status == 200 and len(body) > 1000:
+            return "OK", body
+        return "FAIL", ""
+    except Exception as exc:
+        logger.debug("_cf_worker_attempt error: %s", exc)
+        return "FAIL", ""
+
 
 # ---------------------------------------------------------------------------
 # JS hex-escape decoder (Netflix uses \xNN sequences in inline JS)
@@ -1196,9 +1233,17 @@ def check_cookie(
             last_invalid_html = ""
             last_login_html   = ""
 
-            race_pool = _cf.ThreadPoolExecutor(max_workers=len(proxies))
+            _use_cf = bool(
+                _CF_WORKER_URL
+                and not _using_user_proxies
+                and _proxy_manager
+                and _proxy_manager.cf_relay_enabled
+            )
+            race_pool = _cf.ThreadPoolExecutor(max_workers=len(proxies) + (1 if _use_cf else 0))
             try:
                 futs = {race_pool.submit(_proxy_worker, px): px for px in proxies}
+                if _use_cf:
+                    futs[race_pool.submit(_cf_worker_attempt, url, cookies)] = None
 
                 for fut in _cf.as_completed(futs, timeout=max_wait):
                     try:
