@@ -65,10 +65,35 @@ def _load_admin_id() -> int | None:
             return int(_ADMIN_ID_FILE.read_text().strip())
         except Exception:
             pass
+    # Fallback: restore admin_id from MongoDB on fresh deploy
+    try:
+        import mongo_sync as _ms
+        val = _ms.get_setting("admin_id")
+        if val is not None:
+            uid = int(val)
+            _ADMIN_ID_FILE.write_text(str(uid))
+            return uid
+    except Exception:
+        pass
     return None
 
 def _save_admin_id(uid: int) -> None:
     _ADMIN_ID_FILE.write_text(str(uid))
+    try:
+        import mongo_sync as _ms
+        _ms.save_setting("admin_id", uid)
+    except Exception:
+        pass
+
+
+def _load_admin_id_mongo() -> int | None:
+    """Fallback: restore admin_id from MongoDB if the local file is missing."""
+    try:
+        import mongo_sync as _ms
+        val = _ms.get_setting("admin_id")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
 
 _ADMIN_ID: int | None = _load_admin_id()
 
@@ -3171,9 +3196,12 @@ def _proxy_panel_text() -> str:
 
 
 def _proxy_panel_markup(pm) -> InlineKeyboardMarkup:
-    toggle_label = "🔴 Turn OFF" if pm.enabled else "🟢 Turn ON"
-    cpw_label = "🔴 Proxy ChangePW: OFF" if not pm.changepw_proxy_enabled else "🟢 Proxy ChangePW: ON"
-    direct_label = "👤 Direct Mode: ON" if pm.admin_direct else "👤 Direct Mode: OFF"
+    import os as _os
+    toggle_label  = "🔴 Turn OFF" if pm.enabled else "🟢 Turn ON"
+    cpw_label     = "🔴 Proxy ChangePW: OFF" if not pm.changepw_proxy_enabled else "🟢 Proxy ChangePW: ON"
+    direct_label  = "👤 Direct Mode: ON" if pm.admin_direct else "👤 Direct Mode: OFF"
+    cf_url        = _os.environ.get("CF_WORKER_URL", "")
+    cf_label      = ("☁️ CF Relay: ON 🟢" if pm.cf_relay_enabled else "☁️ CF Relay: OFF 🔴") if cf_url else "☁️ CF Relay: ⚠️ No URL"
     rows = [
         [
             InlineKeyboardButton(toggle_label,          callback_data="proxy:toggle"),
@@ -3189,6 +3217,9 @@ def _proxy_panel_markup(pm) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(direct_label,          callback_data="proxy:toggledirect"),
+        ],
+        [
+            InlineKeyboardButton(cf_label,              callback_data="proxy:cftoggle"),
         ],
     ]
     if pm.count:
@@ -3349,6 +3380,19 @@ async def proxy_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         new_val = pm.toggle_admin_direct()
         state = "ON 👤" if new_val else "OFF"
         await query.answer(f"Admin Direct Mode: {state}", show_alert=False)
+
+    elif action == "proxy:cftoggle":
+        import os as _os
+        if not _os.environ.get("CF_WORKER_URL", ""):
+            await query.answer(
+                "⚠️ CF_WORKER_URL env var is not set.\n"
+                "Add it in Render → Environment → CF_WORKER_URL",
+                show_alert=True,
+            )
+            return
+        new_val = pm.toggle_cf_relay()
+        state = "ON 🟢" if new_val else "OFF 🔴"
+        await query.answer(f"☁️ CF Relay: {state}", show_alert=False)
 
     elif action == "proxy:refresh":
         pass
