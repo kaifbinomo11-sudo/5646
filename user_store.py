@@ -18,6 +18,11 @@ _DB_DIR = Path(os.environ.get("DB_DIR", "."))
 _DB_FILE = _DB_DIR / "user_data.db"
 _lock = threading.Lock()
 
+try:
+    import mongo_sync as _msync
+except ImportError:
+    _msync = None  # type: ignore
+
 
 # ── Token packs — users buy these with Telegram Stars ─────────────────────────
 TOKEN_PACKS: dict[str, dict] = {
@@ -105,7 +110,86 @@ def _init() -> None:
         """)
 
 
+# ── MongoDB sync helpers ───────────────────────────────────────────────────────
+
+def _sync_balance_to_mongo(user_id: int) -> None:
+    """Read current balance from SQLite and mirror it to MongoDB (fire-and-forget)."""
+    if not _msync or not _msync.is_enabled():
+        return
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT balance, total_bought, total_spent, first_seen "
+                "FROM token_balances WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
+        if row:
+            _msync.sync_user_balance(user_id, row[0], row[1], row[2], row[3])
+    except Exception as e:
+        logger.debug("_sync_balance_to_mongo error: %s", e)
+
+
+def _sync_proxies_to_mongo(user_id: int) -> None:
+    """Read current proxy list from SQLite and mirror it to MongoDB (fire-and-forget)."""
+    if not _msync or not _msync.is_enabled():
+        return
+    try:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT url FROM user_proxies WHERE user_id=? ORDER BY added_at ASC",
+                (user_id,)
+            ).fetchall()
+        _msync.sync_user_proxies(user_id, [r[0] for r in rows])
+    except Exception as e:
+        logger.debug("_sync_proxies_to_mongo error: %s", e)
+
+
+def _restore_from_mongo() -> None:
+    """Restore SQLite from MongoDB when local tables are empty (fresh deploy)."""
+    if not _msync or not _msync.is_enabled():
+        return
+    try:
+        with _conn() as c:
+            bal_count = c.execute("SELECT COUNT(*) FROM token_balances").fetchone()[0]
+            prx_count = c.execute("SELECT COUNT(*) FROM user_proxies").fetchone()[0]
+
+        if bal_count == 0:
+            rows = _msync.load_all_balances()
+            if rows:
+                with _conn() as c:
+                    for r in rows:
+                        c.execute(
+                            "INSERT OR IGNORE INTO token_balances "
+                            "(user_id, balance, total_bought, total_spent, first_seen, updated_at) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (r["user_id"], r["balance"], r["total_bought"],
+                             r["total_spent"], r["first_seen"], r.get("updated_at", 0))
+                        )
+                logger.info("mongo_sync: restored %d user balances", len(rows))
+
+        if prx_count == 0:
+            all_proxies = _msync.load_all_user_proxies()
+            if all_proxies:
+                now = time.time()
+                with _conn() as c:
+                    for uid, proxies in all_proxies.items():
+                        for url in proxies:
+                            try:
+                                c.execute(
+                                    "INSERT OR IGNORE INTO user_proxies (user_id, url, added_at) "
+                                    "VALUES (?,?,?)",
+                                    (uid, url, now)
+                                )
+                            except Exception:
+                                pass
+                total = sum(len(v) for v in all_proxies.values())
+                logger.info("mongo_sync: restored %d user proxies", total)
+    except Exception as e:
+        logger.warning("_restore_from_mongo error: %s", e)
+
+
 _init()
+_restore_from_mongo()
 
 
 # ── Config store ───────────────────────────────────────────────────────────────
@@ -199,6 +283,7 @@ def add_user_proxy(user_id: int, raw: str) -> tuple[bool, str]:
             )
         except sqlite3.IntegrityError:
             return False, f"⚠️ Already added: <code>{normalized}</code>"
+    _sync_proxies_to_mongo(user_id)
     return True, normalized
 
 
@@ -212,6 +297,7 @@ def remove_user_proxy(user_id: int, index: int) -> str | None:
         row_id, url = rows[index]
         with _conn() as c:
             c.execute("DELETE FROM user_proxies WHERE id=?", (row_id,))
+        _sync_proxies_to_mongo(user_id)
         return url
     return None
 
@@ -222,6 +308,8 @@ def clear_user_proxies(user_id: int) -> int:
             "SELECT COUNT(*) FROM user_proxies WHERE user_id=?", (user_id,)
         ).fetchone()[0]
         c.execute("DELETE FROM user_proxies WHERE user_id=?", (user_id,))
+    if _msync:
+        _msync.sync_user_proxies(user_id, [])
     return n
 
 
@@ -261,6 +349,7 @@ def register_user(user_id: int) -> None:
     """
     with _conn() as c:
         _ensure_balance_row(user_id, c)
+    _sync_balance_to_mongo(user_id)
 
 
 def get_balance(user_id: int) -> int:
@@ -313,6 +402,7 @@ def add_tokens(user_id: int, amount: int, reason: str = "credit") -> int:
             row = c.execute(
                 "SELECT balance FROM token_balances WHERE user_id=?", (user_id,)
             ).fetchone()
+    _sync_balance_to_mongo(user_id)
     return row[0] if row else 0
 
 
@@ -346,6 +436,7 @@ def deduct_tokens(user_id: int, amount: int, reason: str = "debit") -> tuple[boo
             new_row = c.execute(
                 "SELECT balance FROM token_balances WHERE user_id=?", (user_id,)
             ).fetchone()
+    _sync_balance_to_mongo(user_id)
     return True, (new_row[0] if new_row else 0)
 
 
@@ -371,6 +462,7 @@ def admin_set_tokens(user_id: int, amount: int, reason: str = "admin_set") -> in
                     "INSERT INTO token_transactions (user_id, delta, reason, created_at) VALUES (?,?,?,?)",
                     (user_id, delta, reason, now),
                 )
+    _sync_balance_to_mongo(user_id)
     return amount
 
 
