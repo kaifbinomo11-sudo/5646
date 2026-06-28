@@ -1,0 +1,12 @@
+name            = "netflix-proxy"
+main            = "cf_worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers free tier: 100,000 requests/day
+# Upgrade to $5/mo paid plan for 10M requests/day
+
+[vars]
+# PROXY_KEY is set as a secret (not here) via:
+#   wrangler secret put PROXY_KEY
+# Leave unset to allow unauthenticated access (not recommended)
