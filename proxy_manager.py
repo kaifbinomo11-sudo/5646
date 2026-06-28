@@ -24,6 +24,11 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+try:
+    import mongo_sync as _msync
+except ImportError:
+    _msync = None  # type: ignore
+
 _DB_DIR = Path(os.environ.get("DB_DIR", "."))
 _DB_FILE = _DB_DIR / "proxy_pool.db"
 _AUTO_REFRESH_INTERVAL = 300       # seconds between source re-fetches (5 min)
@@ -124,6 +129,9 @@ def _init_db() -> None:
         conn.execute(
             "INSERT OR IGNORE INTO config (key, value) VALUES ('admin_direct', '0')"
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES ('cf_relay_enabled', '0')"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +168,75 @@ class ProxyManager:
             target=self._background_loop, daemon=True, name="proxy-bg"
         )
         self._bg_thread.start()
+        self._restore_from_mongo()
+
+    def _restore_from_mongo(self) -> None:
+        """Restore proxy pool and sources from MongoDB when SQLite is empty."""
+        if not _msync or not _msync.is_enabled():
+            return
+        try:
+            with _get_conn() as conn:
+                pool_count = conn.execute("SELECT COUNT(*) FROM proxies").fetchone()[0]
+                src_count  = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+
+            if pool_count == 0:
+                rows = _msync.load_proxy_pool()
+                if rows:
+                    with _get_conn() as conn:
+                        for r in rows:
+                            try:
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO proxies "
+                                    "(url, added_at, fail_count, last_fail, last_ok, avg_latency) "
+                                    "VALUES (?,?,?,?,?,?)",
+                                    (r["url"], r.get("added_at", 0), r.get("fail_count", 0),
+                                     r.get("last_fail", 0), r.get("last_ok", 0), r.get("avg_latency"))
+                                )
+                            except Exception:
+                                pass
+                    logger.info("mongo_sync: restored %d admin proxies", len(rows))
+
+            if src_count == 0:
+                sources = _msync.load_proxy_sources()
+                if sources:
+                    with _get_conn() as conn:
+                        for url in sources:
+                            try:
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO sources (url, added_at) VALUES (?,?)",
+                                    (url, time.time())
+                                )
+                            except Exception:
+                                pass
+                    logger.info("mongo_sync: restored %d proxy sources", len(sources))
+        except Exception as e:
+            logger.warning("ProxyManager._restore_from_mongo error: %s", e)
+
+    def _sync_pool_to_mongo(self) -> None:
+        """Read current proxy pool from SQLite and mirror to MongoDB (fire-and-forget)."""
+        if not _msync or not _msync.is_enabled():
+            return
+        try:
+            with _get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT url, added_at, fail_count, last_fail, last_ok, avg_latency FROM proxies"
+                ).fetchall()
+            _msync.sync_proxy_pool([
+                {"url": r[0], "added_at": r[1], "fail_count": r[2],
+                 "last_fail": r[3], "last_ok": r[4], "avg_latency": r[5]}
+                for r in rows
+            ])
+        except Exception as e:
+            logger.debug("_sync_pool_to_mongo error: %s", e)
+
+    def _sync_sources_to_mongo(self) -> None:
+        """Read current source list from SQLite and mirror to MongoDB (fire-and-forget)."""
+        if not _msync or not _msync.is_enabled():
+            return
+        try:
+            _msync.sync_proxy_sources(self.list_sources())
+        except Exception as e:
+            logger.debug("_sync_sources_to_mongo error: %s", e)
 
     # ── Background thread ─────────────────────────────────────────────────
 
@@ -325,6 +402,7 @@ class ProxyManager:
                 "INSERT INTO proxies (url, added_at) VALUES (?, ?)",
                 (normalized, time.time()),
             )
+        self._sync_pool_to_mongo()
         return True, normalized
 
     def remove_proxy(self, index: int) -> str | None:
@@ -336,6 +414,7 @@ class ProxyManager:
             url = rows[index][0]
             with _get_conn() as conn:
                 conn.execute("DELETE FROM proxies WHERE url=?", (url,))
+            self._sync_pool_to_mongo()
             return url
         return None
 
@@ -343,6 +422,7 @@ class ProxyManager:
         with _get_conn() as conn:
             count = conn.execute("SELECT COUNT(*) FROM proxies").fetchone()[0]
             conn.execute("DELETE FROM proxies")
+        self._sync_pool_to_mongo()
         return count
 
     def list_proxies(self) -> list[str]:
@@ -372,6 +452,7 @@ class ProxyManager:
                 "INSERT INTO sources (url, added_at) VALUES (?, ?)",
                 (url, time.time()),
             )
+        self._sync_sources_to_mongo()
         return True, url
 
     def remove_source(self, index: int) -> str | None:
@@ -383,6 +464,7 @@ class ProxyManager:
             url = rows[index][0]
             with _get_conn() as conn:
                 conn.execute("DELETE FROM sources WHERE url=?", (url,))
+            self._sync_sources_to_mongo()
             return url
         return None
 
@@ -475,6 +557,8 @@ class ProxyManager:
                 )
                 if cur.rowcount:
                     added += 1
+        if added:
+            self._sync_pool_to_mongo()
         return added, skipped, ""
 
     def refresh_all_sources(self) -> tuple[int, int, list[str]]:
@@ -648,6 +732,28 @@ class ProxyManager:
                 "INSERT OR REPLACE INTO config (key, value) VALUES ('admin_direct', ?)",
                 ("1" if new_val else "0",),
             )
+        return new_val
+
+    # ── Cloudflare Worker relay toggle ────────────────────────────────────
+
+    @property
+    def cf_relay_enabled(self) -> bool:
+        """Whether the Cloudflare Worker relay is enabled for proxy-pool checks."""
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM config WHERE key='cf_relay_enabled'"
+            ).fetchone()
+        return bool(int(row[0])) if row else False
+
+    def toggle_cf_relay(self) -> bool:
+        new_val = not self.cf_relay_enabled
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('cf_relay_enabled', ?)",
+                ("1" if new_val else "0",),
+            )
+        if _msync:
+            _msync.save_setting("cf_relay_enabled", new_val)
         return new_val
 
     # ── Display ──────────────────────────────────────────────────────────
