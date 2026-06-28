@@ -32,6 +32,59 @@ import requests.adapters
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
+# ---------------------------------------------------------------------------
+# Cloudflare Worker relay — optional fast-path through CF edge network.
+# Set CF_WORKER_URL env var to enable. Optionally set CF_PROXY_KEY.
+# ---------------------------------------------------------------------------
+_CF_WORKER_URL: str = os.environ.get("CF_WORKER_URL", "").rstrip("/")
+_CF_PROXY_KEY:  str = os.environ.get("CF_PROXY_KEY", "")
+
+
+def _cf_worker_attempt(target_url: str, cookies: dict, timeout: float = 8.0):
+    """
+    Send a Netflix request through the Cloudflare Worker relay.
+    Returns ("OK"|"INVALID"|"LOGIN"|"FAIL", html_text).
+    This is raced alongside normal proxies — fastest result wins.
+    """
+    if not _CF_WORKER_URL:
+        return "FAIL", ""
+    try:
+        headers: dict = {}
+        if _CF_PROXY_KEY:
+            headers["X-Proxy-Key"] = _CF_PROXY_KEY
+        headers["Content-Type"] = "application/json"
+
+        payload = json.dumps({
+            "url":     target_url,
+            "cookies": cookies,
+            "method":  "GET",
+        }).encode()
+
+        resp = requests.post(
+            _CF_WORKER_URL,
+            data=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return "FAIL", ""
+
+        data = resp.json()
+        status = data.get("status", 0)
+        body   = data.get("body", "")
+        final_url = data.get("url", target_url)
+
+        if status in (401, 403):
+            return "INVALID", body
+        if _is_login_page(final_url, body):
+            return "LOGIN", body
+        if status == 200 and len(body) > 1000:
+            return "OK", body
+        return "FAIL", ""
+    except Exception as exc:
+        logger.debug("_cf_worker_attempt error: %s", exc)
+        return "FAIL", ""
+
 
 # ---------------------------------------------------------------------------
 # JS hex-escape decoder (Netflix uses \xNN sequences in inline JS)
@@ -1178,8 +1231,11 @@ def check_cookie(
                 proxies = [p for p in proxies if p]
                 _using_user_proxies = False
 
-            if not proxies:
-                logger.debug("_smart_check: proxy pool empty, returning FAIL")
+            # Add CF Worker as a racer if configured (works even with empty proxy pool)
+            _cf_enabled = bool(_CF_WORKER_URL) and not _using_user_proxies
+
+            if not proxies and not _cf_enabled:
+                logger.debug("_smart_check: proxy pool empty and no CF relay, returning FAIL")
                 return "FAIL", ""
 
             max_wait = _proxy_timeout + 3
@@ -1190,15 +1246,22 @@ def check_cookie(
                 return _one_attempt(w_sess, proxy_dict, url,
                                     _is_user_proxy=_using_user_proxies)
 
+            def _cf_worker():
+                return _cf_worker_attempt(url, cookies, timeout=_proxy_timeout)
+
             # Vote counters declared before try so TimeoutError handler can read them
             invalid_votes     = 0
             login_votes       = 0
             last_invalid_html = ""
             last_login_html   = ""
 
-            race_pool = _cf.ThreadPoolExecutor(max_workers=len(proxies))
+            total_racers = len(proxies) + (1 if _cf_enabled else 0)
+            race_pool = _cf.ThreadPoolExecutor(max_workers=max(total_racers, 1))
             try:
                 futs = {race_pool.submit(_proxy_worker, px): px for px in proxies}
+                if _cf_enabled:
+                    cf_fut = race_pool.submit(_cf_worker)
+                    futs[cf_fut] = "__cf_relay__"
 
                 for fut in _cf.as_completed(futs, timeout=max_wait):
                     try:
