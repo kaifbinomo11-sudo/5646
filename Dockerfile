@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.10.1
 
 LABEL maintainer="Netflix Cookie Checker Bot"
 LABEL description="High-speed Netflix cookie checker Telegram bot"
