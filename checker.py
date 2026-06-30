@@ -38,11 +38,22 @@ _CF_WORKER_URL: str = os.environ.get("CF_WORKER_URL", "").rstrip("/")
 _CF_PROXY_KEY:  str = os.environ.get("CF_PROXY_KEY", "")
 
 
+
+# Persistent session for CF Worker calls — reuses TCP connection across checks.
+_cf_session = requests.Session()
+_cf_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=4, pool_maxsize=32, max_retries=0
+)
+_cf_session.mount("https://", _cf_adapter)
+_cf_session.mount("http://",  _cf_adapter)
+
+
 def _cf_worker_attempt(target_url: str, cookies: dict, timeout: float = 8.0):
     """
     Route a Netflix request through the Cloudflare Worker relay.
     Returns ("OK"|"INVALID"|"LOGIN"|"FAIL", html_text).
     Raced alongside normal proxies — fastest result wins.
+    Uses a persistent session for connection reuse (avoids per-call TLS handshake).
     """
     if not _CF_WORKER_URL:
         return "FAIL", ""
@@ -51,7 +62,7 @@ def _cf_worker_attempt(target_url: str, cookies: dict, timeout: float = 8.0):
         if _CF_PROXY_KEY:
             hdrs["X-Proxy-Key"] = _CF_PROXY_KEY
         payload = json.dumps({"url": target_url, "cookies": cookies, "method": "GET"}).encode()
-        resp = requests.post(_CF_WORKER_URL, data=payload, headers=hdrs, timeout=timeout)
+        resp = _cf_session.post(_CF_WORKER_URL, data=payload, headers=hdrs, timeout=timeout)
         if resp.status_code != 200:
             return "FAIL", ""
         data = resp.json()
@@ -1185,65 +1196,84 @@ def check_cookie(
 
         def _smart_check(url):
             """
-            Routing:
-              force_direct=True → direct only.
-              user_proxies set  → race user's own proxies (no admin pool, no feedback).
-              admin pool ON     → race admin proxy pool.
-              admin pool OFF    → direct.
+            Routing logic (all combinations controlled by admin toggles):
+              Proxy OFF, CF OFF → direct connection only
+              Proxy OFF, CF ON  → CF Worker only
+              Proxy ON,  CF OFF → race admin proxy pool only
+              Proxy ON,  CF ON  → race proxy pool + CF Worker (fastest wins)
+
+              user_proxies set  → race user's own proxies (CF excluded, no admin feedback)
+              force_direct=True → bypass everything, go direct
 
             Verdict rules:
-              OK      from any            → accept immediately
-              INVALID from 2+ proxies     → strong consensus, accept
-              INVALID from 1 proxy        → trust after all others finish/fail
-              LOGIN   from 2+ proxies     → cookie genuinely expired (consensus)
-              FAIL    from all            → caller tries next URL or retries
+              OK      from any source      → accept immediately
+              INVALID from 2+ sources      → strong consensus, accept
+              INVALID from 1 source        → accept after all others finish/fail
+              LOGIN   from 2+ sources      → cookie genuinely expired
+              FAIL    from all             → caller tries next URL or retries
             """
-            # ── Direct-only path ──────────────────────────────────────────────
-            if not _proxy_active:
+            # ── Determine which sources are available ─────────────────────────
+            _using_user_proxies = _user_proxy_dicts is not None
+
+            _use_cf = bool(
+                _CF_WORKER_URL
+                and not _using_user_proxies        # user proxies never use CF
+                and _proxy_manager
+                and _proxy_manager.cf_relay_enabled
+            )
+
+            # ── Direct-only path (both proxy and CF off) ───────────────────────
+            if not _proxy_active and not _use_cf:
                 s, h = _one_attempt(session, None, url)
-                if s == "OK":               return "OK",      h
-                if s in ("INVALID","LOGIN"): return "INVALID", h
+                if s == "OK":                return "OK",      h
+                if s in ("INVALID", "LOGIN"): return "INVALID", h
                 return "FAIL", ""
 
-            # ── Pick proxy list: user's own OR admin pool ─────────────────────
+            # ── CF-only path (proxy off, CF on) ────────────────────────────────
+            if not _proxy_active and _use_cf:
+                s, h = _cf_worker_attempt(url, cookies, timeout=_direct_timeout)
+                if s in ("INVALID", "LOGIN"): return "INVALID", h
+                return s, h
+
+            # ── Build proxy list (proxy ON) ────────────────────────────────────
             RACE_N = 3
-            if _user_proxy_dicts is not None:
+            if _using_user_proxies:
                 proxies = _user_proxy_dicts[:RACE_N]
-                _using_user_proxies = True
             else:
                 proxies = _proxy_manager.get_top_proxies_dicts(RACE_N)
                 proxies = [p for p in proxies if p]
-                _using_user_proxies = False
 
+            # Proxy pool empty — fall back to CF if available, else fail
             if not proxies:
-                logger.debug("_smart_check: proxy pool empty, returning FAIL")
+                if _use_cf:
+                    logger.debug("_smart_check: proxy pool empty, falling back to CF Worker")
+                    s, h = _cf_worker_attempt(url, cookies, timeout=_direct_timeout)
+                    if s in ("INVALID", "LOGIN"): return "INVALID", h
+                    return s, h
+                logger.debug("_smart_check: proxy pool empty, no CF, returning FAIL")
                 return "FAIL", ""
 
             max_wait = _proxy_timeout + 3
 
-            # Worker creates session from ITS OWN thread → safe, no sharing
             def _proxy_worker(proxy_dict):
                 w_sess, _ = _make_session(bulk_mode)
                 return _one_attempt(w_sess, proxy_dict, url,
                                     _is_user_proxy=_using_user_proxies)
 
-            # Vote counters declared before try so TimeoutError handler can read them
             invalid_votes     = 0
             login_votes       = 0
             last_invalid_html = ""
             last_login_html   = ""
 
-            _use_cf = bool(
-                _CF_WORKER_URL
-                and not _using_user_proxies
-                and _proxy_manager
-                and _proxy_manager.cf_relay_enabled
-            )
-            race_pool = _cf.ThreadPoolExecutor(max_workers=len(proxies) + (1 if _use_cf else 0))
+            n_workers = len(proxies) + (1 if _use_cf else 0)
+            race_pool = _cf.ThreadPoolExecutor(max_workers=n_workers)
             try:
                 futs = {race_pool.submit(_proxy_worker, px): px for px in proxies}
                 if _use_cf:
-                    futs[race_pool.submit(_cf_worker_attempt, url, cookies)] = None
+                    # CF gets proxy_timeout + 2 — extra buffer for the Worker→Netflix hop
+                    futs[race_pool.submit(
+                        _cf_worker_attempt, url, cookies, _proxy_timeout + 2
+                    )] = None
 
                 for fut in _cf.as_completed(futs, timeout=max_wait):
                     try:
@@ -1257,7 +1287,6 @@ def check_cookie(
                     if s == "INVALID":
                         invalid_votes += 1
                         last_invalid_html = h
-                        # 2+ independent proxies agree → definitive
                         if invalid_votes >= 2:
                             return "INVALID", last_invalid_html
                         continue
@@ -1265,26 +1294,20 @@ def check_cookie(
                     if s == "LOGIN":
                         login_votes += 1
                         last_login_html = h
-                        # 2+ proxies independently show login page → cookie is dead
                         if login_votes >= 2:
                             return "INVALID", last_login_html
                         continue
 
-                    # FAIL → dead/blocked proxy, already hard-removed, keep waiting
+                    # FAIL → dead/blocked source, keep waiting for others
 
-                # All results in — check accumulated votes
                 if invalid_votes >= 1:
                     return "INVALID", last_invalid_html
-                # LOGIN requires 2+ consensus — a single poisoned proxy can serve
-                # a perfect Netflix login page even for a valid cookie.
-                # 1 LOGIN alone → inconclusive → FAIL so caller tries next layer.
                 if login_votes >= 2:
                     return "INVALID", last_login_html
 
                 return "FAIL", ""
 
             except _cf.TimeoutError:
-                # Proxies timed out — trust hard votes (INVALID) only
                 if invalid_votes >= 1:
                     return "INVALID", last_invalid_html
                 return "FAIL", ""
