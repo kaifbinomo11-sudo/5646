@@ -1222,18 +1222,59 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             reply_markup=_settings_markup(uid),
         )
     elif action == "changepw":
+        cost = _TOKEN_COSTS["changepw"]
+        # Admin: free, start immediately
+        if is_admin(uid):
+            _start_changepw_flow(uid)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    "🔐 <b>Change Password</b>  <i>[BETA]</i>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "⚠️ <b>Warning:</b> This will permanently change the account's Netflix password.\n\n"
+                    "Send /cancel at any time to abort.\n\n"
+                    "Step 1 of 3 — Enter the <b>NetflixId</b> cookie value:"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Already in a flow
+        if uid in _CHANGEPW_STATE:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="🔐 You have an active Change Password session. Continue, or /cancel to abort.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Check balance
+        balance = user_store.get_balance(uid)
+        if balance < cost:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    f"🔐 <b>Change Password</b>  <i>[BETA]</i>\n\n"
+                    f"This feature costs <b>{cost} 🪙 tokens</b> per use.\n"
+                    f"Your balance: <b>{balance} 🪙</b>\n\n"
+                    "💰 /buy — Get tokens"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        # Show confirmation (same as changepw_command for non-admins)
+        _CHANGEPW_STATE[uid] = {"step": "confirm_pending"}
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=(
-                "🔐 <b>Change Netflix Password</b>\n\n"
-                "This feature lets you change any Netflix account's password "
-                "directly from the bot — no browser needed.\n\n"
-                "<b>Cost:</b> 5 tokens per change\n\n"
-                "Use the command below to start:"
+                f"🔐 <b>Change Password</b>  <i>[BETA]</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"⚠️ This will permanently change the Netflix account's password.\n\n"
+                f"<b>Cost:</b> {cost} 🪙 tokens  |  <b>Balance:</b> {balance} 🪙\n\n"
+                f"Tap <b>Confirm</b> to proceed:"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Start Password Change", switch_inline_query_current_chat="/changepw"),
+                InlineKeyboardButton("✅ Confirm", callback_data=f"changepw_confirm:yes"),
+                InlineKeyboardButton("❌ Cancel",  callback_data=f"changepw_confirm:no"),
             ]]),
         )
 
