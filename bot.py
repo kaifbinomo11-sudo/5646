@@ -110,6 +110,9 @@ _PROXY_SOURCE_STATE: set[int] = set()  # admin is typing a source URL to import 
 _USER_PROXY_ADD_STATE: set[int] = set()  # user is typing a proxy URL to add
 _USER_PROXY_URL_STATE: set[int] = set()  # user is typing a URL to import proxies from
 
+# ── Admin broadcast flow ──────────────────────────────────────────────────────
+_BROADCAST_PENDING: set[int] = set()  # admin is about to send a broadcast message
+
 # ── Backup group (optional) — set BACKUP_CHAT_ID env var ─────────────────────
 _BACKUP_CHAT_ID: int | None = int(os.environ["BACKUP_CHAT_ID"]) if os.environ.get("BACKUP_CHAT_ID", "").lstrip("-").isdigit() else None
 
@@ -1169,12 +1172,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         user_store.register_user(update.effective_user.id)
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🪙 Buy Tokens",  callback_data="nav:buy"),
-            InlineKeyboardButton("👤 My Account",  callback_data="nav:account"),
+            InlineKeyboardButton("🪙 Buy Tokens",       callback_data="nav:buy"),
+            InlineKeyboardButton("👤 My Account",       callback_data="nav:account"),
         ],
         [
-            InlineKeyboardButton("📖 Help",        callback_data="nav:help"),
-            InlineKeyboardButton("⚙️ Settings",    callback_data="nav:settings"),
+            InlineKeyboardButton("🔐 Change Password ✨", callback_data="nav:changepw"),
+        ],
+        [
+            InlineKeyboardButton("📖 Help",             callback_data="nav:help"),
+            InlineKeyboardButton("⚙️ Settings",         callback_data="nav:settings"),
         ],
     ])
     await update.message.reply_text(
@@ -1185,7 +1191,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📋 <b>Per account</b>\n"
         "Plan · Quality · Country · Price · Billing\n"
         "Email · Phone · Profiles · Login links\n\n"
-        "📦 Bulk mode → live progress → ZIP of all hits",
+        "📦 Bulk mode → live progress → ZIP of all hits\n\n"
+        "🔐 <b>Change Password</b> — Change any Netflix account's password directly from the bot! (5 tokens)",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -1213,6 +1220,21 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             text=_settings_text(uid),
             parse_mode=ParseMode.HTML,
             reply_markup=_settings_markup(uid),
+        )
+    elif action == "changepw":
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "🔐 <b>Change Netflix Password</b>\n\n"
+                "This feature lets you change any Netflix account's password "
+                "directly from the bot — no browser needed.\n\n"
+                "<b>Cost:</b> 5 tokens per change\n\n"
+                "Use the command below to start:"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Start Password Change", switch_inline_query_current_chat="/changepw"),
+            ]]),
         )
 
 
@@ -2130,6 +2152,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"❌ <b>Change Password cancelled.</b>{refund_msg}",
             parse_mode=ParseMode.HTML,
         )
+        return
+    if uid in _BROADCAST_PENDING:
+        _BROADCAST_PENDING.discard(uid)
+        await update.message.reply_text("❌ Broadcast cancelled.")
         return
     if uid in _SETQR_STATE:
         _SETQR_STATE.discard(uid)
@@ -3084,6 +3110,20 @@ async def givetoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"  💰 New balance: <b>{new_bal}</b>",
         parse_mode=ParseMode.HTML,
     )
+    # Notify the recipient
+    try:
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text=(
+                f"🎉 <b>Tokens Added!</b>\n\n"
+                f"🪙 <b>{amount}</b> tokens have been added to your account.\n"
+                f"💰 New balance: <b>{new_bal}</b> tokens\n\n"
+                f"Happy checking! 🎬"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass  # User may not have started the bot yet
 
 
 async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3158,6 +3198,66 @@ async def userstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sign = "+" if t["delta"] > 0 else ""
             lines.append(f"  {sign}{t['delta']} — {t['reason']}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: broadcast a message to all registered users."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ <b>Admin only.</b>", parse_mode=ParseMode.HTML)
+        return
+    _BROADCAST_PENDING.add(uid)
+    total = len(user_store.get_all_user_ids())
+    await update.message.reply_text(
+        f"📢 <b>Broadcast</b>\n\n"
+        f"Total users: <b>{total}</b>\n\n"
+        f"Send the message you want to broadcast.\n"
+        f"Supports: text, bold, italic, links (HTML formatting).\n\n"
+        f"/cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _do_broadcast(context, admin_uid: int, text: str, status_msg) -> None:
+    """Background coroutine: send text to all users with rate limiting."""
+    user_ids = user_store.get_all_user_ids()
+    sent = failed = blocked = 0
+    for i, target_uid in enumerate(user_ids):
+        try:
+            await context.bot.send_message(
+                chat_id=target_uid,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            if "blocked" in err or "deactivated" in err or "not found" in err or "forbidden" in err:
+                blocked += 1
+            else:
+                failed += 1
+        # Telegram: max ~30 msg/sec; stay safe at ~25/sec
+        await asyncio.sleep(0.04)
+        # Update admin every 50 users
+        if (i + 1) % 50 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"📢 Broadcasting… {i+1}/{len(user_ids)}\n"
+                    f"✅ Sent: {sent}  ❌ Failed: {failed}  🚫 Blocked: {blocked}",
+                )
+            except Exception:
+                pass
+    try:
+        await status_msg.edit_text(
+            f"📢 <b>Broadcast complete!</b>\n\n"
+            f"✅ Delivered: <b>{sent}</b>\n"
+            f"🚫 Blocked/inactive: <b>{blocked}</b>\n"
+            f"❌ Other errors: <b>{failed}</b>\n"
+            f"👥 Total: <b>{len(user_ids)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
 
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3434,6 +3534,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     text = update.message.text.strip()
     if not text:
+        return
+
+    # ── Admin broadcast — collect message then fire-and-forget ────────────
+    if uid and uid in _BROADCAST_PENDING and is_admin(uid):
+        _BROADCAST_PENDING.discard(uid)
+        status_msg = await update.message.reply_text(
+            "📢 <b>Broadcast starting…</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        asyncio.create_task(_do_broadcast(context, uid, text, status_msg))
         return
 
     # ── Change Password flow — intercept before the cookie check ──────────
@@ -4152,6 +4262,7 @@ def main() -> None:
     app.add_handler(CommandHandler("userstatus",  userstatus_command))
     app.add_handler(CommandHandler("backup",      backup_command))
     app.add_handler(CommandHandler("setqr",       setqr_command))
+    app.add_handler(CommandHandler("broadcast",   broadcast_command))
 
     # ── Inline button callbacks ───────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(nav_callback,             pattern=r"^nav:"))
@@ -4206,6 +4317,7 @@ def main() -> None:
             BotCommand("info",       "ℹ️ Bot stats & info"),
             BotCommand("cancel",     "❌ Cancel any active flow"),
             BotCommand("userlist",   "👥 Download full user list (admin)"),
+            BotCommand("broadcast",  "📢 Broadcast message to all users (admin)"),
         ])
 
     async def _post_shutdown(application: Application) -> None:
