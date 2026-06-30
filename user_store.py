@@ -483,6 +483,13 @@ def get_recent_transactions(user_id: int, limit: int = 5) -> list[dict]:
     return [{"delta": r[0], "reason": r[1], "created_at": r[2]} for r in rows]
 
 
+def get_all_user_ids() -> list[int]:
+    """Admin: return all registered user IDs (for broadcast)."""
+    with _conn() as c:
+        rows = c.execute("SELECT user_id FROM token_balances").fetchall()
+    return [r[0] for r in rows]
+
+
 def get_all_balances() -> list[dict]:
     """Admin: return all users with token stats."""
     with _conn() as c:
