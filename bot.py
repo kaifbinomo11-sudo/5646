@@ -113,6 +113,9 @@ _USER_PROXY_URL_STATE: set[int] = set()  # user is typing a URL to import proxie
 # ── Admin broadcast flow ──────────────────────────────────────────────────────
 _BROADCAST_PENDING: set[int] = set()  # admin is about to send a broadcast message
 
+# ── Coupon redeem flow ────────────────────────────────────────────────────────
+_REDEEM_PENDING: set[int] = set()  # user is about to type a coupon code
+
 # ── Backup group (optional) — set BACKUP_CHAT_ID env var ─────────────────────
 _BACKUP_CHAT_ID: int | None = int(os.environ["BACKUP_CHAT_ID"]) if os.environ.get("BACKUP_CHAT_ID", "").lstrip("-").isdigit() else None
 
@@ -1167,22 +1170,39 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else 0
     if update.effective_user:
-        stats_tracker.record_user(update.effective_user.id)
-        user_store.register_user(update.effective_user.id)
-    kb = InlineKeyboardMarkup([
+        stats_tracker.record_user(uid)
+        user_store.register_user(uid)
+
+    # ── Welcome bonus (auto-give on first /start if enabled) ──────────────
+    bonus_msg = ""
+    if uid and user_store.welcome_bonus_enabled():
+        new_bal = user_store.give_welcome_bonus(uid)
+        if new_bal != -1:
+            amount = user_store.welcome_bonus_amount()
+            bonus_msg = (
+                f"\n\n🎁 <b>Welcome Gift!</b> You've received <b>{amount} free tokens</b> "
+                f"to get started! 🎉"
+            )
+
+    buttons = [
         [
-            InlineKeyboardButton("🪙 Buy Tokens",       callback_data="nav:buy"),
-            InlineKeyboardButton("👤 My Account",       callback_data="nav:account"),
+            InlineKeyboardButton("🪙 Buy Tokens",        callback_data="nav:buy"),
+            InlineKeyboardButton("👤 My Account",        callback_data="nav:account"),
+        ],
+        [
+            InlineKeyboardButton("🎟️ Redeem Coupon 🎁",  callback_data="nav:redeem"),
         ],
         [
             InlineKeyboardButton("🔐 Change Password ✨", callback_data="nav:changepw"),
         ],
         [
-            InlineKeyboardButton("📖 Help",             callback_data="nav:help"),
-            InlineKeyboardButton("⚙️ Settings",         callback_data="nav:settings"),
+            InlineKeyboardButton("📖 Help",              callback_data="nav:help"),
+            InlineKeyboardButton("⚙️ Settings",          callback_data="nav:settings"),
         ],
-    ])
+    ]
+    kb = InlineKeyboardMarkup(buttons)
     await update.message.reply_text(
         "🎬 <b>Netflix Cookie Checker</b>\n\n"
         "Drop a cookie → get <b>live</b> account details instantly.\n\n"
@@ -1192,7 +1212,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Plan · Quality · Country · Price · Billing\n"
         "Email · Phone · Profiles · Login links\n\n"
         "📦 Bulk mode → live progress → ZIP of all hits\n\n"
-        "🔐 <b>Change Password</b> — Change any Netflix account's password directly from the bot! (5 tokens)",
+        "🔐 <b>Change Password</b> — Change any Netflix account's password directly from the bot! (5 tokens)"
+        + bonus_msg,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -1220,6 +1241,18 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             text=_settings_text(uid),
             parse_mode=ParseMode.HTML,
             reply_markup=_settings_markup(uid),
+        )
+    elif action == "redeem":
+        _REDEEM_PENDING.add(uid)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "🎟️ <b>Redeem Coupon</b>\n\n"
+                "Send your coupon code below:\n"
+                "<i>Codes are case-insensitive</i>\n\n"
+                "/cancel to abort."
+            ),
+            parse_mode=ParseMode.HTML,
         )
     elif action == "changepw":
         cost = _TOKEN_COSTS["changepw"]
@@ -2207,6 +2240,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"❌ <b>Change Password cancelled.</b>{refund_msg}",
             parse_mode=ParseMode.HTML,
         )
+        return
+    if uid in _REDEEM_PENDING:
+        _REDEEM_PENDING.discard(uid)
+        await update.message.reply_text("❌ Coupon redeem cancelled.")
         return
     if uid in _BROADCAST_PENDING:
         _BROADCAST_PENDING.discard(uid)
@@ -3255,6 +3292,158 @@ async def userstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User: redeem a coupon code. Usage: /redeem <code>"""
+    uid = update.effective_user.id if update.effective_user else 0
+    args = context.args or []
+    if not args:
+        _REDEEM_PENDING.add(uid)
+        await update.message.reply_text(
+            "🎟️ <b>Redeem Coupon</b>\n\nSend your coupon code:",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    ok, msg, tokens = user_store.redeem_coupon(args[0], uid)
+    if ok:
+        bal = user_store.get_balance(uid)
+        await update.message.reply_text(
+            f"🎉 <b>Coupon Redeemed!</b>\n\n"
+            f"🎟️ Code: <code>{args[0].upper()}</code>\n"
+            f"🪙 Tokens added: <b>+{tokens}</b>\n"
+            f"💰 New balance: <b>{bal}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+
+async def addcoupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: create a coupon. Usage: /addcoupon <code> <tokens> [max_uses]"""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ <b>Admin only.</b>", parse_mode=ParseMode.HTML)
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /addcoupon &lt;code&gt; &lt;tokens&gt; [max_uses]\n\n"
+            "Examples:\n"
+            "<code>/addcoupon WELCOME500 500</code>  — single use\n"
+            "<code>/addcoupon PROMO100 100 50</code> — 50 uses\n"
+            "<code>/addcoupon FREE50 50 -1</code>    — unlimited uses",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        code = args[0].upper()
+        tokens = int(args[1])
+        max_uses = int(args[2]) if len(args) > 2 else 1
+        if tokens <= 0:
+            raise ValueError("tokens must be positive")
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.HTML)
+        return
+    ok = user_store.create_coupon(code, tokens, max_uses)
+    if ok:
+        uses_label = "unlimited" if max_uses == -1 else str(max_uses)
+        await update.message.reply_text(
+            f"✅ <b>Coupon created!</b>\n\n"
+            f"🎟️ Code: <code>{code}</code>\n"
+            f"🪙 Tokens: <b>{tokens}</b>\n"
+            f"🔢 Max uses: <b>{uses_label}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Coupon code <code>{code}</code> already exists.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def delcoupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: delete a coupon. Usage: /delcoupon <code>"""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ <b>Admin only.</b>", parse_mode=ParseMode.HTML)
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /delcoupon &lt;code&gt;", parse_mode=ParseMode.HTML)
+        return
+    ok = user_store.delete_coupon(args[0])
+    if ok:
+        await update.message.reply_text(f"✅ Coupon <code>{args[0].upper()}</code> deleted.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ Coupon <code>{args[0].upper()}</code> not found.", parse_mode=ParseMode.HTML)
+
+
+async def listcoupons_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: list all coupons."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ <b>Admin only.</b>", parse_mode=ParseMode.HTML)
+        return
+    coupons = user_store.list_coupons()
+    if not coupons:
+        await update.message.reply_text("📋 No coupons yet.\n\nUse /addcoupon to create one.", parse_mode=ParseMode.HTML)
+        return
+    lines = ["🎟️ <b>Active Coupons</b>\n"]
+    for c in coupons:
+        uses_label = "∞" if c["max_uses"] == -1 else f"{c['used_count']}/{c['max_uses']}"
+        status = "✅" if c["active"] else "❌"
+        lines.append(
+            f"{status} <code>{c['code']}</code> — <b>{c['token_amount']} tokens</b> — used: {uses_label}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def welcomebonus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: toggle welcome bonus. Usage: /welcomebonus on [amount] | off | status"""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ <b>Admin only.</b>", parse_mode=ParseMode.HTML)
+        return
+    args = context.args or []
+    enabled = user_store.welcome_bonus_enabled()
+    amount  = user_store.welcome_bonus_amount()
+    if not args:
+        status = "🟢 ON" if enabled else "🔴 OFF"
+        await update.message.reply_text(
+            f"🎁 <b>Welcome Bonus</b>\n\n"
+            f"Status: <b>{status}</b>\n"
+            f"Amount: <b>{amount} tokens</b>\n\n"
+            f"Commands:\n"
+            f"  /welcomebonus on [amount] — enable\n"
+            f"  /welcomebonus off — disable",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    action = args[0].lower()
+    if action == "on":
+        if len(args) > 1:
+            try:
+                new_amount = int(args[1])
+                if new_amount <= 0:
+                    raise ValueError
+                user_store.set_setting("welcome_bonus_amount", str(new_amount))
+                amount = new_amount
+            except ValueError:
+                await update.message.reply_text("❌ Invalid amount.", parse_mode=ParseMode.HTML)
+                return
+        user_store.set_setting("welcome_bonus_enabled", "1")
+        await update.message.reply_text(
+            f"✅ <b>Welcome bonus enabled!</b>\n🪙 New users get <b>{amount} free tokens</b> on /start.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif action == "off":
+        user_store.set_setting("welcome_bonus_enabled", "0")
+        await update.message.reply_text("✅ <b>Welcome bonus disabled.</b>", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(
+            "Usage: /welcomebonus on [amount] | off", parse_mode=ParseMode.HTML
+        )
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin: broadcast a message to all registered users."""
     uid = update.effective_user.id if update.effective_user else 0
@@ -3589,6 +3778,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     text = update.message.text.strip()
     if not text:
+        return
+
+    # ── Coupon redeem — collect code ──────────────────────────────────────
+    if uid and uid in _REDEEM_PENDING:
+        _REDEEM_PENDING.discard(uid)
+        ok, msg, tokens = user_store.redeem_coupon(text.strip(), uid)
+        if ok:
+            bal = user_store.get_balance(uid)
+            await update.message.reply_text(
+                f"🎉 <b>Coupon Redeemed!</b>\n\n"
+                f"🎟️ Code: <code>{text.strip().upper()}</code>\n"
+                f"🪙 Tokens added: <b>+{tokens}</b>\n"
+                f"💰 New balance: <b>{bal}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
     # ── Admin broadcast — collect message then fire-and-forget ────────────
@@ -4318,6 +4524,11 @@ def main() -> None:
     app.add_handler(CommandHandler("backup",      backup_command))
     app.add_handler(CommandHandler("setqr",       setqr_command))
     app.add_handler(CommandHandler("broadcast",   broadcast_command))
+    app.add_handler(CommandHandler("redeem",      redeem_command))
+    app.add_handler(CommandHandler("addcoupon",   addcoupon_command))
+    app.add_handler(CommandHandler("delcoupon",   delcoupon_command))
+    app.add_handler(CommandHandler("listcoupons", listcoupons_command))
+    app.add_handler(CommandHandler("welcomebonus",welcomebonus_command))
 
     # ── Inline button callbacks ───────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(nav_callback,             pattern=r"^nav:"))
@@ -4371,8 +4582,12 @@ def main() -> None:
             BotCommand("help",       "📖 Supported cookie formats"),
             BotCommand("info",       "ℹ️ Bot stats & info"),
             BotCommand("cancel",     "❌ Cancel any active flow"),
+            BotCommand("redeem",     "🎟️ Redeem a coupon code for free tokens"),
             BotCommand("userlist",   "👥 Download full user list (admin)"),
             BotCommand("broadcast",  "📢 Broadcast message to all users (admin)"),
+            BotCommand("addcoupon",  "🎟️ Create coupon code (admin)"),
+            BotCommand("listcoupons","📋 List all coupons (admin)"),
+            BotCommand("welcomebonus","🎁 Toggle welcome bonus (admin)"),
         ])
 
     async def _post_shutdown(application: Application) -> None:
