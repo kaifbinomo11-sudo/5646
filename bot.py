@@ -4583,11 +4583,6 @@ def main() -> None:
             BotCommand("info",       "ℹ️ Bot stats & info"),
             BotCommand("cancel",     "❌ Cancel any active flow"),
             BotCommand("redeem",     "🎟️ Redeem a coupon code for free tokens"),
-            BotCommand("userlist",   "👥 Download full user list (admin)"),
-            BotCommand("broadcast",  "📢 Broadcast message to all users (admin)"),
-            BotCommand("addcoupon",  "🎟️ Create coupon code (admin)"),
-            BotCommand("listcoupons","📋 List all coupons (admin)"),
-            BotCommand("welcomebonus","🎁 Toggle welcome bonus (admin)"),
         ])
 
     async def _post_shutdown(application: Application) -> None:
