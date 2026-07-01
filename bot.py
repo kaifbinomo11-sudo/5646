@@ -1791,6 +1791,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     mode_label     = "Full Info" if _get_mode(uid) == "full" else "Basic"
     delivery_label = "Card-by-Card 💬" if _get_delivery(uid) == "cards" else "ZIP 📦"
 
+    users_line = f"  👤 Unique users    »  <b>{users}</b>\n" if is_admin(uid) else ""
     await update.message.reply_text(
         "ℹ️ <b>Netflix Cookie Checker — Bot Info</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1806,7 +1807,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  🔓 Free accounts   »  <b>{frees}</b>\n"
         f"  ❌ Invalid/Expired »  <b>{invalids}</b>\n"
         f"  ⚠️ Errors          »  <b>{errors}</b>\n"
-        f"  👤 Unique users    »  <b>{users}</b>\n"
+        f"{users_line}"
         f"  🔄 Active checks   »  <b>{active}</b>\n"
         f"  🚀 Speed (last 60s)»  <b>{cpm} checks/min</b>\n\n"
         "⚙️ <b>Your Settings</b>\n"
@@ -3118,25 +3119,7 @@ async def adminpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(uid):
         await update.message.reply_text("⛔ Admin only.", parse_mode=ParseMode.HTML)
         return
-    token_users = user_store.get_all_balances()
-    active = [u for u in token_users if u["balance"] > 0]
-    lines = [
-        "👑 <b>Admin Panel</b>",
-        "",
-        f"👥 Token holders: <b>{len(active)}</b>",
-        f"📊 Total users tracked: <b>{len(token_users)}</b>",
-        "",
-        "<b>Token Commands:</b>",
-        "  /givetoken &lt;user_id&gt; &lt;amount&gt; — Give tokens",
-        "  /revoke &lt;user_id&gt; — Zero out a user's tokens",
-        "  /userstatus &lt;user_id&gt; — Check user details",
-        "  /backup — Send data backup",
-        "  /setqr — Set external payment QR (reply to photo)",
-        "",
-        "<b>Admin management is here — /account for your own profile.</b>",
-        "  /userlist — Download full user list as .txt",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await _send_admin_panel(update.message.chat_id, context)
 
 
 async def userlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3442,15 +3425,6 @@ async def welcomebonus_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "Usage: /welcomebonus on [amount] | off", parse_mode=ParseMode.HTML
         )
-
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin: show admin control panel."""
-    uid = update.effective_user.id if update.effective_user else 0
-    if not is_admin(uid):
-        await update.message.reply_text("⛔ <b>Admin only.</b>", parse_mode=ParseMode.HTML)
-        return
-    await _send_admin_panel(update.message.chat_id, context)
 
 
 async def _send_admin_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4722,7 +4696,6 @@ def main() -> None:
     app.add_handler(CommandHandler("userstatus",  userstatus_command))
     app.add_handler(CommandHandler("backup",      backup_command))
     app.add_handler(CommandHandler("setqr",       setqr_command))
-    app.add_handler(CommandHandler("admin",        admin_command))
     app.add_handler(CommandHandler("broadcast",   broadcast_command))
     app.add_handler(CommandHandler("redeem",      redeem_command))
     app.add_handler(CommandHandler("addcoupon",   addcoupon_command))
