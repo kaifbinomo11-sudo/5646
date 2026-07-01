@@ -107,6 +107,24 @@ def _init() -> None:
                 total_stars INTEGER NOT NULL DEFAULT 0,
                 updated_at  REAL    NOT NULL DEFAULT 0
             );
+
+            -- Coupon codes
+            CREATE TABLE IF NOT EXISTS coupons (
+                code         TEXT    PRIMARY KEY,
+                token_amount INTEGER NOT NULL,
+                max_uses     INTEGER NOT NULL DEFAULT 1,
+                used_count   INTEGER NOT NULL DEFAULT 0,
+                active       INTEGER NOT NULL DEFAULT 1,
+                created_at   REAL    NOT NULL DEFAULT 0
+            );
+
+            -- Track which user used which coupon
+            CREATE TABLE IF NOT EXISTS coupon_uses (
+                code    TEXT    NOT NULL,
+                user_id INTEGER NOT NULL,
+                used_at REAL    NOT NULL DEFAULT 0,
+                PRIMARY KEY (code, user_id)
+            );
         """)
 
 
@@ -488,6 +506,131 @@ def get_all_user_ids() -> list[int]:
     with _conn() as c:
         rows = c.execute("SELECT user_id FROM token_balances").fetchall()
     return [r[0] for r in rows]
+
+
+# ── Bot settings (welcome bonus, etc.) ────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    with _conn() as c:
+        row = c.execute("SELECT value FROM config_store WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO config_store (key, value) VALUES (?,?)",
+            (key, value),
+        )
+
+
+# ── Welcome bonus ──────────────────────────────────────────────────────────────
+
+def welcome_bonus_enabled() -> bool:
+    return get_setting("welcome_bonus_enabled", "0") == "1"
+
+
+def welcome_bonus_amount() -> int:
+    try:
+        return int(get_setting("welcome_bonus_amount", "500"))
+    except ValueError:
+        return 500
+
+
+def has_received_welcome_bonus(user_id: int) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM token_transactions WHERE user_id=? AND reason='welcome_bonus' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def give_welcome_bonus(user_id: int) -> int:
+    """Give welcome bonus tokens. Returns new balance, or -1 if already received."""
+    if has_received_welcome_bonus(user_id):
+        return -1
+    amount = welcome_bonus_amount()
+    return add_tokens(user_id, amount, reason="welcome_bonus")
+
+
+# ── Coupon codes ───────────────────────────────────────────────────────────────
+
+def create_coupon(code: str, token_amount: int, max_uses: int = 1) -> bool:
+    """Create a coupon code. Returns False if code already exists."""
+    code = code.upper().strip()
+    try:
+        with _conn() as c:
+            c.execute(
+                "INSERT INTO coupons (code, token_amount, max_uses, used_count, active, created_at) "
+                "VALUES (?,?,?,0,1,?)",
+                (code, token_amount, max_uses, time.time()),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def delete_coupon(code: str) -> bool:
+    """Delete a coupon code. Returns False if not found."""
+    code = code.upper().strip()
+    with _conn() as c:
+        cur = c.execute("DELETE FROM coupons WHERE code=?", (code,))
+    return cur.rowcount > 0
+
+
+def list_coupons() -> list[dict]:
+    """Admin: list all coupon codes with stats."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT code, token_amount, max_uses, used_count, active, created_at "
+            "FROM coupons ORDER BY created_at DESC"
+        ).fetchall()
+    return [
+        {
+            "code": r[0], "token_amount": r[1], "max_uses": r[2],
+            "used_count": r[3], "active": bool(r[4]), "created_at": r[5],
+        }
+        for r in rows
+    ]
+
+
+def redeem_coupon(code: str, user_id: int) -> tuple[bool, str, int]:
+    """
+    Redeem a coupon for a user.
+    Returns (success, message, tokens_given).
+    """
+    code = code.upper().strip()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT token_amount, max_uses, used_count, active FROM coupons WHERE code=?",
+            (code,),
+        ).fetchone()
+        if not row:
+            return False, "❌ Invalid coupon code.", 0
+        token_amount, max_uses, used_count, active = row
+        if not active:
+            return False, "❌ This coupon has been deactivated.", 0
+        if max_uses != -1 and used_count >= max_uses:
+            return False, "❌ This coupon has already been fully used.", 0
+        # Check if user already used this coupon
+        already = c.execute(
+            "SELECT 1 FROM coupon_uses WHERE code=? AND user_id=?",
+            (code, user_id),
+        ).fetchone()
+        if already:
+            return False, "❌ You have already redeemed this coupon.", 0
+        # Record use
+        c.execute(
+            "INSERT INTO coupon_uses (code, user_id, used_at) VALUES (?,?,?)",
+            (code, user_id, time.time()),
+        )
+        c.execute(
+            "UPDATE coupons SET used_count = used_count + 1 WHERE code=?",
+            (code,),
+        )
+    new_bal = add_tokens(user_id, token_amount, reason=f"coupon_{code}")
+    return True, "✅ Coupon redeemed!", token_amount
 
 
 def get_all_balances() -> list[dict]:
